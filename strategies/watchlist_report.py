@@ -103,6 +103,15 @@ def main() -> None:
                     setup_status,
                 ) = row
 
+                display_symbol = display_symbol or "N/A"
+                display_name = display_name or "N/A"
+                change_24h = change_24h if change_24h is not None else 0
+                change_15m = change_15m if change_15m is not None else 0
+                change_1h = change_1h if change_1h is not None else 0
+                rv15 = rv15 if rv15 is not None else 0
+                rv1h = rv1h if rv1h is not None else 0
+                spread = spread if spread is not None else 0
+
                 print(
                     f"{setup_status:28} | "
                     f"{display_symbol:16} | "

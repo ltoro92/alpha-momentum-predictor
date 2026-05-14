@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+
+# Local data exports
+data/
+*.csv
+*.jsonl
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/settings.json
+
+# Docker / database local
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+tmp/
+temp/
