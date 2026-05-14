@@ -1,0 +1,89 @@
+experiment:
+  name: alpha_momentum_predictor_v0
+  version: "2.1"
+  status: frozen_for_initial_validation
+  initial_capital_usdt: 200
+  duration_days: 7
+  market: binance_alpha
+  real_money: false
+
+financial_targets:
+  strong_target_usdt: 600
+  victory_target_usdt: 1000
+
+filters:
+  price_change_24h_min_pct: -10
+  price_change_24h_max_pct: 25
+  min_volume_24h_usdt: 50000
+  max_spread_pct: 4
+  max_slippage_pct: 6
+  strong_drop_pct: -10
+  strong_drop_window_hours: 2
+  extreme_pump_pct: 60
+  extreme_pump_window_hours: 4
+
+momentum:
+  positive_15m_lookback_candles: 3
+  positive_1h_lookback_candles: 2
+
+relative_volume:
+  sma_lookback_candles: 20
+  medium_signal_15m_min: 2.0
+  medium_signal_1h_min: 1.5
+  high_signal_15m_min: 4.0
+  high_signal_1h_min: 2.5
+
+signal_levels:
+  medium:
+    allocation_pct: 25
+    max_spread_pct: 4
+    max_slippage_pct: 6
+  high:
+    allocation_pct: 50
+    max_spread_pct: 2
+    max_slippage_pct: 3
+
+exit_rules:
+  stop_loss_pct: -10
+  tp1_pct: 20
+  tp2_pct: 35
+  tp3_pct: 50
+  timeout_hours: 24
+  move_stop_to_break_even_after_tp1: true
+  protect_profit_after_tp2: true
+
+partial_exit:
+  tp1_position_pct: 40
+  tp2_position_pct: 30
+  tp3_position_pct: 30
+
+fees:
+  entry_fee_pct: 0.1
+  exit_fee_pct: 0.1
+
+risk_controls:
+  max_simultaneous_trades: 2
+  no_averaging_down: true
+  no_increase_position_in_drawdown: true
+  reduce_size_after_losses: 2
+  pause_after_losses: 3
+  protection_mode_capital_usdt: 600
+  victory_mode_capital_usdt: 1000
+
+liquidity_gate:
+  enabled: true
+  max_spread_pct: 4
+  max_slippage_pct: 6
+  order_book_depth_limit: 20
+
+benchmarks:
+  - random_alpha
+  - simple_momentum
+  - late_top_gainers
+  - basic_filter
+
+validation:
+  min_profit_factor: 1.5
+  max_drawdown_pct: 25
+  require_ev_positive: true
+  require_benchmark_outperformance: true
