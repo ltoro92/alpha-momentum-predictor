@@ -7,22 +7,7 @@ STEPS = [
         "name": "Actualizar candidatos, velas y order books",
         "command": ["python", "collector/candidate_refresh_collector.py"],
     },
-    {
-        "name": "Limpiar features previas",
-        "command": [
-            "docker",
-            "exec",
-            "-i",
-            "alpha_momentum_postgres",
-            "psql",
-            "-U",
-            "alpha_user",
-            "-d",
-            "alpha_momentum",
-            "-c",
-            "TRUNCATE TABLE features CASCADE;",
-        ],
-    },
+    
     {
         "name": "Calcular features",
         "command": ["python", "strategies/features_calculator.py"],
