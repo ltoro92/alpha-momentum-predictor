@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-INTERVAL_SECONDS = 300  # 5 minutos
+INTERVAL_SECONDS = 1200  # 20 minutos
 LOG_FILE = Path("logs/monitor_loop.log")
 
 
@@ -69,4 +69,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
