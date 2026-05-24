@@ -1,5 +1,15 @@
-import psycopg2
+import sys
+from pathlib import Path
 from decimal import Decimal
+
+import psycopg2
+
+
+# Permite importar desde /strategies aunque este archivo esté en /simulator
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(PROJECT_ROOT))
+
+from strategies.signal_ranker import score_signal  # noqa: E402
 
 
 DB_CONFIG = {
@@ -16,29 +26,74 @@ MAX_OPEN_TRADES = 2
 
 
 # -------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------
+
+def to_decimal(value, default="0"):
+    if value is None:
+        return Decimal(default)
+
+    if isinstance(value, Decimal):
+        return value
+
+    return Decimal(str(value))
+
+
+# -------------------------------------------------------------------
 # CAPITAL
 # -------------------------------------------------------------------
 
-def get_current_capital(cur):
+def get_realized_capital(cur):
     """
-    Devuelve el último capital_after disponible.
-    Si todavía no hay trades cerrados, usa el capital inicial ficticio.
+    Calcula capital global correcto:
+
+    capital inicial + suma de P/L de todos los trades cerrados.
+
+    Esto corrige el problema de leer capital_after desde una sola fila,
+    que no sirve cuando hubo trades simultáneos.
     """
     cur.execute("""
-        SELECT capital_after
+        SELECT
+            COALESCE(
+                SUM(
+                    allocated_capital * (net_return_pct / 100)
+                ),
+                0
+            ) AS realized_pnl
         FROM simulated_trades
         WHERE strategy_name = %s
-          AND capital_after IS NOT NULL
-        ORDER BY closed_at DESC NULLS LAST, created_at DESC
-        LIMIT 1;
+          AND status = 'closed'
+          AND net_return_pct IS NOT NULL;
     """, (STRATEGY_NAME,))
 
-    row = cur.fetchone()
+    realized_pnl = to_decimal(cur.fetchone()[0])
+    return INITIAL_CAPITAL + realized_pnl
 
-    if row and row[0] is not None:
-        return Decimal(row[0])
 
-    return INITIAL_CAPITAL
+def get_open_allocated_capital(cur):
+    """
+    Capital actualmente comprometido en trades abiertos.
+    """
+    cur.execute("""
+        SELECT COALESCE(SUM(allocated_capital), 0)
+        FROM simulated_trades
+        WHERE strategy_name = %s
+          AND status = 'open';
+    """, (STRATEGY_NAME,))
+
+    return to_decimal(cur.fetchone()[0])
+
+
+def get_available_capital(cur):
+    realized_capital = get_realized_capital(cur)
+    open_allocated = get_open_allocated_capital(cur)
+
+    available = realized_capital - open_allocated
+
+    if available < 0:
+        return Decimal("0")
+
+    return available
 
 
 # -------------------------------------------------------------------
@@ -46,9 +101,6 @@ def get_current_capital(cur):
 # -------------------------------------------------------------------
 
 def count_open_trades(cur):
-    """
-    Cuenta trades abiertos para respetar el límite de operaciones simultáneas.
-    """
     cur.execute("""
         SELECT COUNT(*)
         FROM simulated_trades
@@ -59,19 +111,32 @@ def count_open_trades(cur):
     return cur.fetchone()[0]
 
 
+def get_open_trade_symbols(cur):
+    cur.execute("""
+        SELECT DISTINCT symbol
+        FROM simulated_trades
+        WHERE strategy_name = %s
+          AND status = 'open';
+    """, (STRATEGY_NAME,))
+
+    return {row[0] for row in cur.fetchall()}
+
+
 # -------------------------------------------------------------------
-# TRAER SEÑALES NUEVAS
+# TRAER SEÑALES ABIERTAS CON FEATURES
 # -------------------------------------------------------------------
 
 def get_open_signals_without_trade(cur):
     """
-    Trae señales abiertas que todavía no tengan trade simulado asociado.
+    Trae señales abiertas que todavía no tengan trade asociado,
+    junto con sus features para poder calcular ranking_score.
     """
     cur.execute("""
         SELECT
-            s.id,
+            s.id AS signal_id,
             s.experiment_run_id,
             s.token_id,
+            s.feature_id,
             s.symbol,
             s.signal_level,
             s.price_at_signal,
@@ -80,55 +145,134 @@ def get_open_signals_without_trade(cur):
             s.tp1_price,
             s.tp2_price,
             s.tp3_price,
-            s.allocation_pct
+            s.allocation_pct,
+            s.created_at,
+
+            f.price_change_15m_pct,
+            f.price_change_1h_pct,
+            f.price_change_24h_pct,
+            f.relative_volume_15m,
+            f.relative_volume_1h,
+            f.spread_pct,
+            f.liquidity_gate_passed
         FROM signals s
+        LEFT JOIN features f
+            ON f.id = s.feature_id
         LEFT JOIN simulated_trades t
             ON t.signal_id = s.id
         WHERE s.status = 'open'
           AND t.id IS NULL
-        ORDER BY 
-            CASE 
-                WHEN s.signal_level = 'high' THEN 1
-                WHEN s.signal_level = 'medium' THEN 2
-                ELSE 3
-            END,
-            s.created_at ASC;
+        ORDER BY s.created_at ASC;
     """)
 
-    return cur.fetchall()
+    columns = [desc[0] for desc in cur.description]
+    rows = cur.fetchall()
+
+    return [dict(zip(columns, row)) for row in rows]
+
+
+# -------------------------------------------------------------------
+# RANKING Y DEDUP
+# -------------------------------------------------------------------
+
+def rank_and_deduplicate_signals(signals, open_trade_symbols):
+    """
+    Ordena señales por ranking_score y deja solo la mejor señal por símbolo.
+
+    También excluye símbolos que ya tienen trade abierto.
+    """
+    ranked = []
+
+    for signal in signals:
+        if signal["symbol"] in open_trade_symbols:
+            continue
+
+        signal["ranking_score"] = score_signal(signal)
+        ranked.append(signal)
+
+    ranked.sort(
+        key=lambda item: (
+            item.get("ranking_score", 0),
+            1 if item.get("signal_level") == "high" else 0,
+            item.get("created_at"),
+        ),
+        reverse=True,
+    )
+
+    best_by_symbol = {}
+    superseded_signal_ids = []
+
+    for signal in ranked:
+        symbol = signal["symbol"]
+
+        if symbol not in best_by_symbol:
+            best_by_symbol[symbol] = signal
+        else:
+            superseded_signal_ids.append(signal["signal_id"])
+
+    selected = list(best_by_symbol.values())
+
+    selected.sort(
+        key=lambda item: (
+            item.get("ranking_score", 0),
+            1 if item.get("signal_level") == "high" else 0,
+        ),
+        reverse=True,
+    )
+
+    return selected, superseded_signal_ids
+
+
+def mark_superseded_signals(cur, signal_ids):
+    if not signal_ids:
+        return
+
+    signal_ids_as_text = [str(signal_id) for signal_id in signal_ids]
+
+    cur.execute("""
+        UPDATE signals
+        SET status = 'superseded'
+        WHERE id::text = ANY(%s);
+    """, (signal_ids_as_text,))
 
 
 # -------------------------------------------------------------------
 # ABRIR TRADE
 # -------------------------------------------------------------------
 
-def open_simulated_trade(cur, signal, capital_before):
-    (
-        signal_id,
-        experiment_run_id,
-        token_id,
-        symbol,
-        signal_level,
-        price_at_signal,
-        realistic_entry_price,
-        stop_price,
-        tp1_price,
-        tp2_price,
-        tp3_price,
-        allocation_pct,
-    ) = signal
+def open_simulated_trade(cur, signal, realized_capital, available_capital):
+    signal_id = signal["signal_id"]
+    experiment_run_id = signal["experiment_run_id"]
+    token_id = signal["token_id"]
+    symbol = signal["symbol"]
+    signal_level = signal["signal_level"]
+    price_at_signal = signal["price_at_signal"]
+    realistic_entry_price = signal["realistic_entry_price"]
+    stop_price = signal["stop_price"]
+    tp1_price = signal["tp1_price"]
+    tp2_price = signal["tp2_price"]
+    tp3_price = signal["tp3_price"]
+    allocation_pct = signal["allocation_pct"]
+    ranking_score = signal.get("ranking_score", 0)
 
-    entry_price = Decimal(realistic_entry_price or price_at_signal)
+    entry_price = to_decimal(realistic_entry_price or price_at_signal)
 
     if entry_price <= 0:
         print(f"[SKIP] {symbol} precio inválido: {entry_price}")
         return None
 
-    allocation = Decimal(allocation_pct) / Decimal("100")
-    allocated_capital = capital_before * allocation
+    allocation = to_decimal(allocation_pct) / Decimal("100")
+    allocated_capital = realized_capital * allocation
 
     if allocated_capital <= 0:
         print(f"[SKIP] {symbol} capital asignado inválido: {allocated_capital}")
+        return None
+
+    if allocated_capital > available_capital:
+        print(
+            f"[SKIP] {symbol} capital insuficiente. "
+            f"Necesita={allocated_capital}, disponible={available_capital}"
+        )
         return None
 
     quantity = allocated_capital / entry_price
@@ -168,7 +312,7 @@ def open_simulated_trade(cur, signal, capital_before):
         token_id,
         symbol,
         STRATEGY_NAME,
-        capital_before,
+        realized_capital,
         allocated_capital,
         quantity,
         price_at_signal,
@@ -197,10 +341,12 @@ def open_simulated_trade(cur, signal, capital_before):
             jsonb_build_object(
                 'signal_level', %s,
                 'capital_before', %s,
+                'available_capital_before', %s,
                 'allocated_capital', %s,
                 'entry_price', %s,
                 'quantity', %s,
-                'allocation_pct', %s
+                'allocation_pct', %s,
+                'ranking_score', %s
             )
         );
     """, (
@@ -209,22 +355,31 @@ def open_simulated_trade(cur, signal, capital_before):
         symbol,
         f"Opened simulated trade for {symbol}",
         signal_level,
-        str(capital_before),
+        str(realized_capital),
+        str(available_capital),
         str(allocated_capital),
         str(entry_price),
         str(quantity),
         str(allocation_pct),
+        str(ranking_score),
     ))
 
-    # Marcar señal como ejecutada para no duplicar trades.
-    # El trade queda abierto; la señal solo queda consumida.
     cur.execute("""
         UPDATE signals
         SET status = 'executed'
         WHERE id = %s;
     """, (signal_id,))
 
-    return trade_id, allocated_capital, quantity, entry_price
+    # Evita que señales viejas del mismo símbolo se ejecuten después.
+    cur.execute("""
+        UPDATE signals
+        SET status = 'superseded'
+        WHERE symbol = %s
+          AND status = 'open'
+          AND id <> %s;
+    """, (symbol, signal_id))
+
+    return trade_id, allocated_capital, quantity, entry_price, ranking_score
 
 
 # -------------------------------------------------------------------
@@ -237,39 +392,56 @@ def main():
     try:
         with conn:
             with conn.cursor() as cur:
-                signals = get_open_signals_without_trade(cur)
+                open_trades = count_open_trades(cur)
+                open_trade_symbols = get_open_trade_symbols(cur)
 
-                if not signals:
-                    print("No hay señales abiertas sin trade simulado.")
+                realized_capital = get_realized_capital(cur)
+                available_capital = get_available_capital(cur)
+
+                signals = get_open_signals_without_trade(cur)
+                ranked_signals, superseded_ids = rank_and_deduplicate_signals(
+                    signals,
+                    open_trade_symbols
+                )
+
+                mark_superseded_signals(cur, superseded_ids)
+
+                print(f"Capital realizado: {realized_capital}")
+                print(f"Capital disponible: {available_capital}")
+                print(f"Trades abiertos actuales: {open_trades}")
+                print(f"Señales open encontradas: {len(signals)}")
+                print(f"Señales rankeadas/deduplicadas: {len(ranked_signals)}")
+
+                if not ranked_signals:
+                    print("No hay señales abiertas disponibles para abrir trade.")
                     return
 
-                open_trades = count_open_trades(cur)
-
-                print(f"Señales nuevas: {len(signals)}")
-                print(f"Trades abiertos actuales: {open_trades}")
-
-                for signal in signals:
+                for signal in ranked_signals:
                     if open_trades >= MAX_OPEN_TRADES:
                         print(f"Máximo de trades abiertos alcanzado ({MAX_OPEN_TRADES}).")
                         break
 
-                    capital_before = get_current_capital(cur)
+                    available_capital = get_available_capital(cur)
 
                     result = open_simulated_trade(
                         cur,
                         signal,
-                        capital_before
+                        realized_capital,
+                        available_capital
                     )
 
                     if not result:
                         continue
 
-                    trade_id, allocated_capital, quantity, entry_price = result
+                    trade_id, allocated_capital, quantity, entry_price, ranking_score = result
                     open_trades += 1
 
-                    print("-" * 80)
+                    print("-" * 100)
                     print(f"[TRADE OPEN] {trade_id}")
-                    print(f"Capital antes: {capital_before}")
+                    print(f"Symbol: {signal['symbol']}")
+                    print(f"Level: {signal['signal_level']}")
+                    print(f"Ranking score: {ranking_score}")
+                    print(f"Capital base: {realized_capital}")
                     print(f"Capital asignado: {allocated_capital}")
                     print(f"Precio entrada: {entry_price}")
                     print(f"Cantidad: {quantity}")
