@@ -5,7 +5,6 @@ from datetime import datetime
 from pathlib import Path
 
 
-
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -17,7 +16,7 @@ INTERVAL_SECONDS = 1200  # 20 minutos
 LOG_FILE = Path("logs/experiment_loop.log")
 
 
-def write_log(text: str):
+def write_log(text: str) -> None:
     LOG_FILE.parent.mkdir(exist_ok=True)
 
     with LOG_FILE.open("a", encoding="utf-8") as file:
@@ -31,7 +30,7 @@ def run_command(command: str) -> int:
         capture_output=True,
         text=True,
         encoding="utf-8",
-        errors="replace"
+        errors="replace",
     )
 
     output_parts = []
@@ -43,17 +42,6 @@ def run_command(command: str) -> int:
         output_parts.append(result.stderr.strip())
 
     output = "\n".join(output_parts)
-
-    if output:
-        print(output)
-        write_log(output)
-
-    return result.returncode
-
-    output = result.stdout.strip()
-
-    if result.stderr:
-        output += "\n" + result.stderr.strip()
 
     if output:
         print(output)
@@ -78,7 +66,7 @@ def run_step(name: str, command: str) -> bool:
     return True
 
 
-def run_experiment_cycle():
+def run_experiment_cycle() -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     header = f"\n{'#' * 100}\nEXPERIMENT CYCLE — {now}\n{'#' * 100}"
@@ -88,15 +76,15 @@ def run_experiment_cycle():
     steps = [
         (
             "Actualizar mercado, calcular features y generar señales",
-            "python run_cycle.py"
+            "python run_cycle.py",
         ),
         (
             "Abrir trades simulados si hay cupo",
-            "python simulator/paper_trader.py"
+            "python simulator/paper_trader.py",
         ),
         (
             "Actualizar y evaluar trades abiertos",
-            "python monitor_open_trades.py"
+            "python monitor_open_trades.py",
         ),
     ]
 
@@ -114,7 +102,7 @@ def run_experiment_cycle():
     write_log(footer)
 
 
-def main():
+def main() -> None:
     print("Loop automático del experimento iniciado.")
     print("Este proceso corre run_cycle.py + paper_trader.py + monitor_open_trades.py.")
     print("No cierres esta terminal si querés que siga corriendo.")

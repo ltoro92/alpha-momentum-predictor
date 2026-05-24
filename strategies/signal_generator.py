@@ -32,11 +32,55 @@ TP2_PCT = Decimal("35")
 TP3_PCT = Decimal("50")
 
 
+# -------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------
+
 def pct_price(price: Decimal, pct: Decimal) -> Decimal:
     return price * (Decimal("1") + (pct / Decimal("100")))
 
 
+def json_default(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+
+    return str(value)
+
+
+def build_feature_snapshot(feature: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Snapshot mínimo de la feature para dejar trazabilidad en signal_logs.
+    """
+    return {
+        "feature_id": str(feature.get("feature_id")),
+        "token_id": str(feature.get("token_id")),
+        "symbol": feature.get("symbol"),
+        "price": json_default(feature.get("price")),
+        "price_change_15m_pct": json_default(feature.get("price_change_15m_pct")),
+        "price_change_1h_pct": json_default(feature.get("price_change_1h_pct")),
+        "price_change_24h_pct": json_default(feature.get("price_change_24h_pct")),
+        "relative_volume_15m": json_default(feature.get("relative_volume_15m")),
+        "relative_volume_1h": json_default(feature.get("relative_volume_1h")),
+        "spread_pct": json_default(feature.get("spread_pct")),
+        "estimated_slippage_pct": json_default(feature.get("estimated_slippage_pct")),
+        "liquidity_gate_passed": feature.get("liquidity_gate_passed"),
+        "momentum_15m_positive": feature.get("momentum_15m_positive"),
+        "momentum_1h_positive": feature.get("momentum_1h_positive"),
+        "momentum_1h_recovering": feature.get("momentum_1h_recovering"),
+        "strong_drop_active": feature.get("strong_drop_active"),
+        "extreme_pump_recent": feature.get("extreme_pump_recent"),
+    }
+
+
+# -------------------------------------------------------------------
+# DATA ACCESS
+# -------------------------------------------------------------------
+
 def get_latest_features(conn) -> List[Dict[str, Any]]:
+    """
+    Trae la última feature por símbolo.
+    """
+
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -66,45 +110,50 @@ def get_latest_features(conn) -> List[Dict[str, Any]]:
                     collected_at
                 FROM raw_tickers_24h
                 ORDER BY symbol, collected_at DESC
-            ) t ON t.symbol = f.symbol
+            ) t
+                ON t.symbol = f.symbol
             ORDER BY f.symbol, f.calculated_at DESC;
             """
         )
 
         rows = cur.fetchall()
 
-    return [
-        {
-            "feature_id": row[0],
-            "token_id": row[1],
-            "symbol": row[2],
-            "price_change_15m_pct": row[3],
-            "price_change_1h_pct": row[4],
-            "price_change_24h_pct": row[5],
-            "relative_volume_15m": row[6],
-            "relative_volume_1h": row[7],
-            "spread_pct": row[8],
-            "estimated_slippage_pct": row[9],
-            "liquidity_gate_passed": row[10],
-            "momentum_15m_positive": row[11],
-            "momentum_1h_positive": row[12],
-            "momentum_1h_recovering": row[13],
-            "strong_drop_active": row[14],
-            "extreme_pump_recent": row[15],
-            "price": row[16],
-        }
-        for row in rows
-    ]
+        return [
+            {
+                "feature_id": row[0],
+                "token_id": row[1],
+                "symbol": row[2],
+                "price_change_15m_pct": row[3],
+                "price_change_1h_pct": row[4],
+                "price_change_24h_pct": row[5],
+                "relative_volume_15m": row[6],
+                "relative_volume_1h": row[7],
+                "spread_pct": row[8],
+                "estimated_slippage_pct": row[9],
+                "liquidity_gate_passed": row[10],
+                "momentum_15m_positive": row[11],
+                "momentum_1h_positive": row[12],
+                "momentum_1h_recovering": row[13],
+                "strong_drop_active": row[14],
+                "extreme_pump_recent": row[15],
+                "price": row[16],
+            }
+            for row in rows
+        ]
 
 
-def already_has_recent_signal(conn, symbol: str) -> bool:
+def has_open_signal(conn, symbol: str) -> bool:
+    """
+    Bloquea si ya existe una señal abierta para el mismo símbolo.
+    """
+
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT 1
             FROM signals
             WHERE symbol = %s
-            AND created_at >= NOW() - INTERVAL '4 hours'
+              AND status = 'open'
             LIMIT 1;
             """,
             (symbol,),
@@ -113,9 +162,119 @@ def already_has_recent_signal(conn, symbol: str) -> bool:
         return cur.fetchone() is not None
 
 
-def classify_signal(feature: Dict[str, Any]) -> Dict[str, Any]:
-    reasons = []
+def has_open_trade(conn, symbol: str) -> bool:
+    """
+    Bloquea si ya existe un trade abierto para el mismo símbolo.
+    """
 
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM simulated_trades
+            WHERE symbol = %s
+              AND status = 'open'
+            LIMIT 1;
+            """,
+            (symbol,),
+        )
+
+        return cur.fetchone() is not None
+
+
+def has_recent_executed_signal(conn, symbol: str, hours: int = 4) -> bool:
+    """
+    Evita spam de señales ejecutadas demasiado recientes.
+
+    No bloquea señales superseded ni señales cerradas viejas.
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM signals
+            WHERE symbol = %s
+              AND status = 'executed'
+              AND created_at >= NOW() - (%s || ' hours')::interval
+            LIMIT 1;
+            """,
+            (symbol, hours),
+        )
+
+        return cur.fetchone() is not None
+
+
+def get_duplicate_reason(conn, symbol: str) -> str | None:
+    """
+    Devuelve motivo concreto de bloqueo por duplicado.
+    """
+
+    if has_open_trade(conn, symbol):
+        return "open_trade_exists"
+
+    if has_open_signal(conn, symbol):
+        return "open_signal_exists"
+
+    if has_recent_executed_signal(conn, symbol):
+        return "recent_executed_signal_exists"
+
+    return None
+
+
+# -------------------------------------------------------------------
+# DECISION LOGGING
+# -------------------------------------------------------------------
+
+def log_signal_decision(
+    conn,
+    *,
+    symbol: str,
+    action: str,
+    message: str,
+    payload: Dict[str, Any],
+    signal_id: Any = None,
+    experiment_run_id: Any = None,
+) -> None:
+    """
+    Registra una decisión del motor de señales en signal_logs.
+
+    Acciones esperadas:
+    - NO_SIGNAL
+    - DUPLICATE
+    - SIGNAL_CREATED
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO signal_logs (
+                experiment_run_id,
+                signal_id,
+                symbol,
+                action,
+                message,
+                payload
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s
+            );
+            """,
+            (
+                experiment_run_id,
+                signal_id,
+                symbol,
+                action,
+                message,
+                json.dumps(payload, default=json_default),
+            ),
+        )
+
+
+# -------------------------------------------------------------------
+# CLASSIFICATION
+# -------------------------------------------------------------------
+
+def classify_signal(feature: Dict[str, Any]) -> Dict[str, Any]:
     required_checks = {
         "liquidity_gate_passed": feature["liquidity_gate_passed"] is True,
         "momentum_15m_positive": feature["momentum_15m_positive"] is True,
@@ -143,7 +302,11 @@ def classify_signal(feature: Dict[str, Any]) -> Dict[str, Any]:
         "no_extreme_pump": feature["extreme_pump_recent"] is False,
     }
 
-    failed = [name for name, passed in required_checks.items() if not passed]
+    failed = [
+        name
+        for name, passed in required_checks.items()
+        if not passed
+    ]
 
     if failed:
         return {
@@ -165,7 +328,11 @@ def classify_signal(feature: Dict[str, Any]) -> Dict[str, Any]:
         "momentum_1h_positive": feature["momentum_1h_positive"] is True,
     }
 
-    high_failed = [name for name, passed in high_checks.items() if not passed]
+    high_failed = [
+        name
+        for name, passed in high_checks.items()
+        if not passed
+    ]
 
     if not high_failed:
         return {
@@ -194,7 +361,11 @@ def classify_signal(feature: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def save_signal(conn, feature: Dict[str, Any], classification: Dict[str, Any]) -> None:
+# -------------------------------------------------------------------
+# SAVE SIGNAL
+# -------------------------------------------------------------------
+
+def save_signal(conn, feature: Dict[str, Any], classification: Dict[str, Any]):
     price = feature["price"]
 
     stop_price = pct_price(price, STOP_LOSS_PCT)
@@ -222,10 +393,16 @@ def save_signal(conn, feature: Dict[str, Any], classification: Dict[str, Any]) -
                 created_at
             )
             VALUES (
-                %s, %s, %s, %s, 'open',
-                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s,
+                %s,
+                'open',
+                %s, %s,
+                %s, %s, %s, %s,
+                %s,
+                %s,
                 NOW()
-            );
+            )
+            RETURNING id;
             """,
             (
                 feature["token_id"],
@@ -239,10 +416,16 @@ def save_signal(conn, feature: Dict[str, Any], classification: Dict[str, Any]) -
                 tp2_price,
                 tp3_price,
                 classification["allocation_pct"],
-                json.dumps(classification["reason"], default=str),
+                json.dumps(classification["reason"], default=json_default),
             ),
         )
 
+        return cur.fetchone()[0]
+
+
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
 
 def main() -> None:
     conn = psycopg2.connect(**DB_CONFIG)
@@ -261,17 +444,58 @@ def main() -> None:
                 symbol = feature["symbol"]
 
                 classification = classify_signal(feature)
+                feature_snapshot = build_feature_snapshot(feature)
 
                 if not classification["has_signal"]:
                     no_signal += 1
+
+                    log_signal_decision(
+                        conn,
+                        symbol=symbol,
+                        action="NO_SIGNAL",
+                        message=f"No signal generated for {symbol}",
+                        payload={
+                            "classification": classification["reason"],
+                            "feature": feature_snapshot,
+                        },
+                    )
+
                     continue
 
-                if already_has_recent_signal(conn, symbol):
+                duplicate_reason = get_duplicate_reason(conn, symbol)
+
+                if duplicate_reason:
                     duplicates += 1
-                    print(f"[DUPLICATE] {symbol}: ya tiene señal reciente")
+
+                    log_signal_decision(
+                        conn,
+                        symbol=symbol,
+                        action="DUPLICATE",
+                        message=f"Signal candidate duplicated for {symbol}: {duplicate_reason}",
+                        payload={
+                            "duplicate_reason": duplicate_reason,
+                            "classification": classification["reason"],
+                            "feature": feature_snapshot,
+                        },
+                    )
+
+                    print(f"[DUPLICATE] {symbol}: {duplicate_reason}")
                     continue
 
-                save_signal(conn, feature, classification)
+                signal_id = save_signal(conn, feature, classification)
+
+                log_signal_decision(
+                    conn,
+                    symbol=symbol,
+                    signal_id=signal_id,
+                    action="SIGNAL_CREATED",
+                    message=f"Signal created for {symbol}",
+                    payload={
+                        "classification": classification["reason"],
+                        "feature": feature_snapshot,
+                    },
+                )
+
                 signals_created += 1
 
                 print(

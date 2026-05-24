@@ -19,8 +19,24 @@ DB_CONFIG = {
     "password": "alpha_password",
 }
 
-MIN_PRICE_CHANGE_24H = Decimal("-10")
-MAX_PRICE_CHANGE_24H = Decimal("25")
+
+# -------------------------------------------------------------------
+# CANDIDATE RULES
+# -------------------------------------------------------------------
+# TRADE_CANDIDATE:
+#   Rango operativo v0. Estos pueden llegar a señal operable.
+#
+# OBSERVATION_CANDIDATE:
+#   Casos extremos tipo ZEST. Se descargan velas/order book/features
+#   para análisis, pero no deberían operarse por ahora.
+# -------------------------------------------------------------------
+
+TRADE_MIN_PRICE_CHANGE_24H = Decimal("-10")
+TRADE_MAX_PRICE_CHANGE_24H = Decimal("25")
+
+OBSERVATION_MIN_PRICE_CHANGE_24H = Decimal("25")
+OBSERVATION_MAX_PRICE_CHANGE_24H = Decimal("1000")
+
 MIN_QUOTE_VOLUME_USDT = Decimal("50000")
 
 DEPTH_LIMIT = 20
@@ -32,6 +48,10 @@ INTERVALS = {
     "1h": 30,
 }
 
+
+# -------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------
 
 def to_decimal(value: Any):
     if value is None:
@@ -47,6 +67,10 @@ def millis_to_timestamp_sql(value: Any) -> float:
     return int(value) / 1000.0
 
 
+# -------------------------------------------------------------------
+# TOKENS / TICKERS
+# -------------------------------------------------------------------
+
 def get_tradeable_symbols() -> List[Dict[str, Any]]:
     conn = psycopg2.connect(**DB_CONFIG)
 
@@ -57,7 +81,7 @@ def get_tradeable_symbols() -> List[Dict[str, Any]]:
                 SELECT id, symbol
                 FROM raw_tokens
                 WHERE symbol LIKE 'ALPHA_%%USDT'
-                AND is_active = TRUE
+                  AND is_active = TRUE
                 ORDER BY symbol;
                 """
             )
@@ -135,19 +159,62 @@ def save_ticker(conn, token_id: str, symbol: str, ticker: Dict[str, Any]) -> Non
         )
 
 
-def is_candidate(ticker: Dict[str, Any]) -> bool:
+# -------------------------------------------------------------------
+# CANDIDATE CLASSIFICATION
+# -------------------------------------------------------------------
+
+def classify_candidate(ticker: Dict[str, Any]) -> str | None:
+    """
+    Clasifica el ticker como candidato de trading u observación.
+
+    TRADE_CANDIDATE:
+      Entra dentro del rango operativo v0:
+      -10% <= 24h <= 25%
+
+    OBSERVATION_CANDIDATE:
+      Movimiento extremo:
+      25% < 24h <= 1000%
+
+      Se observa y se mide, pero no debería operar hasta que
+      signal_generator implemente explícitamente esa distinción.
+
+    None:
+      No entra al análisis profundo.
+    """
     change = to_decimal(ticker.get("priceChangePercent"))
     quote_volume = to_decimal(ticker.get("quoteVolume"))
 
     if change is None or quote_volume is None:
-        return False
+        return None
 
-    return (
-        change >= MIN_PRICE_CHANGE_24H
-        and change <= MAX_PRICE_CHANGE_24H
-        and quote_volume >= MIN_QUOTE_VOLUME_USDT
-    )
+    if quote_volume < MIN_QUOTE_VOLUME_USDT:
+        return None
 
+    if (
+        change >= TRADE_MIN_PRICE_CHANGE_24H
+        and change <= TRADE_MAX_PRICE_CHANGE_24H
+    ):
+        return "TRADE_CANDIDATE"
+
+    if (
+        change > OBSERVATION_MIN_PRICE_CHANGE_24H
+        and change <= OBSERVATION_MAX_PRICE_CHANGE_24H
+    ):
+        return "OBSERVATION_CANDIDATE"
+
+    return None
+
+
+def is_candidate(ticker: Dict[str, Any]) -> bool:
+    """
+    Compatibilidad temporal con la lógica anterior.
+    """
+    return classify_candidate(ticker) is not None
+
+
+# -------------------------------------------------------------------
+# KLINES
+# -------------------------------------------------------------------
 
 def get_klines(symbol: str, interval: str, limit: int) -> List[List[Any]]:
     response = requests.get(
@@ -238,6 +305,10 @@ def save_klines(conn, token_id: str, symbol: str, interval: str, klines: List[Li
 
     return saved
 
+
+# -------------------------------------------------------------------
+# ORDER BOOK
+# -------------------------------------------------------------------
 
 def get_order_book(symbol: str) -> Dict[str, Any]:
     response = requests.get(
@@ -348,6 +419,10 @@ def save_order_book(conn, token_id: str, symbol: str, order_book: Dict[str, Any]
         )
 
 
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
+
 def main() -> None:
     symbols = get_tradeable_symbols()
 
@@ -371,12 +446,15 @@ def main() -> None:
                     save_ticker(conn, token_id, symbol, ticker)
                     ticker_saved += 1
 
-                    if is_candidate(ticker):
+                    candidate_type = classify_candidate(ticker)
+
+                    if candidate_type:
                         candidates.append(
                             {
                                 "token_id": token_id,
                                 "symbol": symbol,
                                 "ticker": ticker,
+                                "candidate_type": candidate_type,
                             }
                         )
 
@@ -386,9 +464,21 @@ def main() -> None:
 
                 time.sleep(0.10)
 
+        trade_candidates = sum(
+            1 for candidate in candidates
+            if candidate.get("candidate_type") == "TRADE_CANDIDATE"
+        )
+
+        observation_candidates = sum(
+            1 for candidate in candidates
+            if candidate.get("candidate_type") == "OBSERVATION_CANDIDATE"
+        )
+
         print(f"Tickers guardados: {ticker_saved}")
         print(f"Errores ticker: {ticker_failed}")
         print(f"Candidatos detectados: {len(candidates)}")
+        print(f"Trade candidates: {trade_candidates}")
+        print(f"Observation candidates: {observation_candidates}")
 
         candle_saved = 0
         candle_failed = 0
@@ -399,6 +489,9 @@ def main() -> None:
             for item in candidates:
                 token_id = item["token_id"]
                 symbol = item["symbol"]
+                candidate_type = item.get("candidate_type")
+
+                print(f"[CANDIDATE] {candidate_type} | {symbol}")
 
                 for interval, limit in INTERVALS.items():
                     try:

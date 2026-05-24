@@ -2,12 +2,18 @@ import subprocess
 import sys
 
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
 STEPS = [
     {
         "name": "Actualizar candidatos, velas y order books",
         "command": ["python", "collector/candidate_refresh_collector.py"],
     },
-    
     {
         "name": "Calcular features",
         "command": ["python", "strategies/features_calculator.py"],
@@ -23,24 +29,36 @@ STEPS = [
 ]
 
 
-def run_step(step_name: str, command: list[str]) -> None:
+def run_step(step):
     print("\n" + "=" * 100)
-    print(f"PASO: {step_name}")
+    print(f"PASO: {step['name']}")
     print("=" * 100)
 
-    result = subprocess.run(command)
+    result = subprocess.run(
+        step["command"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    if result.stdout:
+        print(result.stdout)
+
+    if result.stderr:
+        print(result.stderr)
 
     if result.returncode != 0:
-        print(f"\nERROR en paso: {step_name}")
-        print(f"Comando fallido: {' '.join(command)}")
+        print(f"\nERROR en paso: {step['name']}")
+        print(f"Comando fallido: {' '.join(step['command'])}")
         sys.exit(result.returncode)
 
 
-def main() -> None:
+def main():
     print("Iniciando ciclo Alpha Momentum Predictor...")
 
     for step in STEPS:
-        run_step(step["name"], step["command"])
+        run_step(step)
 
     print("\n" + "=" * 100)
     print("CICLO FINALIZADO")
